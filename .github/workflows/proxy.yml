@@ -1,0 +1,100 @@
+name: proxy
+
+# Поднимает SOCKS5 + HTTP прокси внутри runner'а и публикует его через ngrok (wstunnel).
+# Локально подключаемся: wstunnel client -L socks5://127.0.0.1:1080 -L http://127.0.0.1:8080 -P <WSTUNNEL_PATH> wss://<host>
+#
+# Секреты репозитория (Settings -> Secrets and variables -> Actions):
+#   NGROK_AUTHTOKEN  — authtoken из dashboard.ngrok.com
+#   WSTUNNEL_PATH    — любой случайный префикс пути, он же пароль для туннеля (например: 7f3c1a9e/proxy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Сколько минут держать прокси (1-350)"
+        required: false
+        default: "350"
+
+concurrency:
+  group: proxy-tunnel
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tunnel:
+    name: socks5 + http
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    env:
+      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      WSTUNNEL_PATH: ${{ secrets.WSTUNNEL_PATH }}
+
+    steps:
+      - name: Скачать wstunnel и ngrok
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/wst.tgz \
+            https://github.com/erebe/wstunnel/releases/latest/download/wstunnel_11.1.0_linux_amd64.tar.gz
+          curl -fsSL -o /tmp/ngrok.tgz \
+            https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+          tar xzf /tmp/wst.tgz -C /tmp
+          tar xzf /tmp/ngrok.tgz -C /tmp
+          chmod +x /tmp/wstunnel /tmp/ngrok
+          /tmp/wstunnel --version
+
+      - name: Поднять туннель
+        run: |
+          set -euo pipefail
+
+          if [ -z "${NGROK_AUTHTOKEN:-}" ]; then
+            echo "::error::секрет NGROK_AUTHTOKEN не задан"; exit 1
+          fi
+          if [ -z "${WSTUNNEL_PATH:-}" ]; then
+            echo "::error::секрет WSTUNNEL_PATH не задан"; exit 1
+          fi
+
+          echo "::add-mask::$WSTUNNEL_PATH"
+          echo "::add-mask::$NGROK_AUTHTOKEN"
+
+          /tmp/wstunnel server --restrict-http-upgrade-path-prefix "$WSTUNNEL_PATH" \
+            ws://127.0.0.1:8099 >/tmp/wst.log 2>&1 &
+          /tmp/ngrok config add-authtoken "$NGROK_AUTHTOKEN" >/dev/null
+          /tmp/ngrok http 8099 --log=stdout >/tmp/ngrok.log 2>&1 &
+
+          URL=""
+          for _ in $(seq 1 30); do
+            URL="$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
+                    | grep -o 'https://[^"]*' | head -1 || true)"
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          if [ -z "$URL" ]; then
+            echo "::error::ngrok не отдал адрес"
+            tail -n 40 /tmp/ngrok.log
+            exit 1
+          fi
+
+          HOST="${URL#https://}"
+          {
+            echo "### Прокси поднят"
+            echo ""
+            echo "Хост: \`wss://$HOST\`"
+            echo ""
+            echo "Подключение локально (вместо \`<WSTUNNEL_PATH>\` — ваш секрет):"
+            echo '```'
+            echo "wstunnel client -L socks5://127.0.0.1:1080 -L http://127.0.0.1:8080 -P <WSTUNNEL_PATH> wss://$HOST"
+            echo '```'
+            echo ""
+            echo "SOCKS5 \`127.0.0.1:1080\` · HTTP \`127.0.0.1:8080\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "HOST=$HOST"
+
+      - name: Держать открытым
+        run: |
+          MIN="${{ github.event.inputs.minutes }}"
+          case "$MIN" in ''|*[!0-9]*) MIN=350 ;; esac
+          [ "$MIN" -gt 350 ] && MIN=350
+          echo "Держим $MIN мин, до $(date -u -d "+$MIN minutes" '+%H:%M UTC')"
+          sleep $((MIN * 60))
